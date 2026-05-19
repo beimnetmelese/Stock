@@ -1,4 +1,4 @@
-import {
+import React, {
   useEffect,
   useMemo,
   useRef,
@@ -27,13 +27,10 @@ import {
 import {
   ArrowUpRight,
   BadgePercent,
-  Bell,
   Box,
   CheckCircle2,
   ChevronDown,
-  Download,
   Edit3,
-  FileText,
   Filter,
   History,
   LayoutDashboard,
@@ -48,7 +45,6 @@ import {
   SunMedium,
   Trash2,
   TrendingUp,
-  UserCircle2,
   Warehouse,
   X,
 } from "lucide-react";
@@ -65,29 +61,44 @@ import {
 } from "react-router-dom";
 import "./App.css";
 import {
-  analyticsRevenue,
-  analyticsTables,
-  bestSellingProducts,
-  dashboardMetricsByRange,
   dateRangeOptions,
-  inventoryBatches,
-  inventoryMovement,
-  lowStockAlerts,
-  monthlyRevenue,
-  products,
-  recentSales,
-  salesCatalog,
-  salesHistory,
-  salesOverviewByRange,
   type CartItem,
   type DateRangeKey,
   type Product,
 } from "./data/mockData";
+import { BackendProvider, useBackendData } from "./lib/backend";
+import {
+  clearAuthSession,
+  getAuthSession,
+  restoreAuthSession,
+  signInWithSupabase,
+  signOutFromSupabase,
+} from "./lib/supabase";
 import { cn } from "./lib/utils";
 
-type ThemeMode = "light" | "dark";
+const svgImage = (label: string, color: string) => {
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="${color}" />
+          <stop offset="100%" stop-color="#0f172a" />
+        </linearGradient>
+      </defs>
+      <rect width="160" height="160" rx="34" fill="url(#g)" />
+      <circle cx="122" cy="42" r="20" fill="rgba(255,255,255,0.16)" />
+      <text x="50%" y="54%" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="36" font-weight="700" fill="white">${label}</text>
+    </svg>
+  `;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+};
 
-const authKey = "stock-auth-token";
+type ThemeMode = "light" | "dark";
+type AuthSubmitResult = {
+  status: "authenticated" | "confirmation" | "error";
+  message: string;
+};
+
 const themeKey = "stock-theme";
 const currencyFormatter = new Intl.NumberFormat("en-US");
 
@@ -100,116 +111,315 @@ const navItems = [
   { label: "Analytics", path: "/analytics", icon: TrendingUp },
 ];
 
+const getProductImage = (name: string): string => {
+  const colors = [
+    "#ea580c",
+    "#0891b2",
+    "#059669",
+    "#7c3aed",
+    "#dc2626",
+    "#f59e0b",
+    "#06b6d4",
+    "#10b981",
+  ];
+  const label = name
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .substring(0, 2)
+    .toUpperCase();
+  const hash = name.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  const color = colors[hash % colors.length];
+  return svgImage(label, color);
+};
+
+function LoadingOverlay() {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/60 dark:bg-slate-900/60">
+      <div className="flex items-center gap-4 rounded-2xl bg-white/90 p-6 shadow-lg dark:bg-slate-900/80">
+        <svg
+          className="h-10 w-10 animate-spin text-sky-500"
+          viewBox="0 0 24 24"
+        >
+          <circle
+            className="opacity-25"
+            cx="12"
+            cy="12"
+            r="10"
+            stroke="currentColor"
+            strokeWidth="4"
+            fill="none"
+          />
+          <path
+            className="opacity-75"
+            fill="currentColor"
+            d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+          />
+        </svg>
+        <div>
+          <div className="font-medium text-slate-900 dark:text-white">
+            Loading data from Supabase
+          </div>
+          <div className="text-sm text-slate-600 dark:text-slate-300">
+            Fetching products, inventory and sales...
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [theme, setThemeState] = useState<ThemeMode>(() => {
-    if (typeof window === "undefined") {
-      return "light";
+    try {
+      if (typeof window === "undefined") return "light" as ThemeMode;
+      return (window.localStorage.getItem(themeKey) as ThemeMode) ?? "light";
+    } catch {
+      return "light" as ThemeMode;
     }
-
-    return (
-      (window.localStorage.getItem(themeKey) as ThemeMode | null) ?? "light"
-    );
   });
-  const [isAuthenticated, setIsAuthenticated] = useState(() => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-
-    return Boolean(
-      window.localStorage.getItem(authKey) ||
-      window.sessionStorage.getItem(authKey),
-    );
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
-    window.localStorage.setItem(themeKey, theme);
+    try {
+      window.localStorage.setItem(themeKey, theme);
+    } catch {}
   }, [theme]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const initializeAuth = async () => {
+      const session = await restoreAuthSession();
+
+      if (!cancelled) {
+        setIsAuthenticated(Boolean(session));
+        setAuthReady(true);
+      }
+    };
+
+    void initializeAuth();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
+
+    const checkSession = () => {
+      try {
+        const s = getAuthSession();
+        if (!s) {
+          clearAuthSession();
+          setIsAuthenticated(false);
+          if (window.location.pathname !== "/login") {
+            window.location.href = "/login";
+          }
+          return;
+        }
+
+        if (s.expiresAt && Date.now() > s.expiresAt) {
+          clearAuthSession();
+          setIsAuthenticated(false);
+          if (window.location.pathname !== "/login") {
+            window.location.href = "/login";
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    checkSession();
+    const id = window.setInterval(checkSession, 30 * 1000);
+
+    return () => window.clearInterval(id);
+  }, [authReady]);
+
+  const handleAuthSubmit = async ({
+    email,
+    password,
+    rememberMe,
+  }: {
+    email: string;
+    password: string;
+    rememberMe: boolean;
+  }): Promise<AuthSubmitResult> => {
+    try {
+      await signInWithSupabase({ email, password, rememberMe });
+      setIsAuthenticated(true);
+      return {
+        status: "authenticated",
+        message: "Signed in with Supabase.",
+      };
+    } catch (error) {
+      setIsAuthenticated(false);
+      return {
+        status: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Supabase authentication failed.",
+      };
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOutFromSupabase();
+    clearAuthSession();
+    setIsAuthenticated(false);
+  };
 
   const setTheme = (nextTheme: ThemeMode) => {
     setThemeState(nextTheme);
   };
 
-  const handleLogin = (rememberMe: boolean) => {
-    window.sessionStorage.removeItem(authKey);
-
-    if (rememberMe) {
-      window.localStorage.setItem(authKey, "true");
-    } else {
-      window.localStorage.removeItem(authKey);
-      window.sessionStorage.setItem(authKey, "true");
-    }
-
-    setIsAuthenticated(true);
-  };
-
-  const handleLogout = () => {
-    window.localStorage.removeItem(authKey);
-    window.sessionStorage.removeItem(authKey);
-    setIsAuthenticated(false);
-  };
+  if (!authReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
+        Checking Supabase session...
+      </div>
+    );
+  }
 
   return (
-    <Router>
-      <Routes>
-        <Route
-          path="/login"
-          element={
-            isAuthenticated ? (
-              <Navigate to="/dashboard" replace />
-            ) : (
-              <LoginPage
-                theme={theme}
-                setTheme={setTheme}
-                onLogin={handleLogin}
-              />
-            )
-          }
-        />
-        <Route
-          element={
-            isAuthenticated ? (
-              <DashboardLayout
-                theme={theme}
-                setTheme={setTheme}
-                onLogout={handleLogout}
-              />
-            ) : (
-              <Navigate to="/login" replace />
-            )
-          }
-        >
-          <Route index element={<Navigate to="/dashboard" replace />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/products" element={<ProductsPage />} />
-          <Route path="/inventory" element={<InventoryPage />} />
-          <Route path="/sales" element={<SalesPage />} />
-          <Route path="/sales-history" element={<SalesHistoryPage />} />
-          <Route path="/analytics" element={<AnalyticsPage />} />
-        </Route>
-      </Routes>
-    </Router>
+    <ErrorBoundary>
+      <BackendProvider>
+        <Router>
+          <Routes>
+            <Route
+              path="/login"
+              element={
+                isAuthenticated ? (
+                  <Navigate to="/dashboard" replace />
+                ) : (
+                  <LoginPage
+                    theme={theme}
+                    setTheme={setTheme}
+                    onAuthSubmit={handleAuthSubmit}
+                  />
+                )
+              }
+            />
+            <Route
+              element={
+                isAuthenticated ? (
+                  <DashboardLayout
+                    theme={theme}
+                    setTheme={setTheme}
+                    onLogout={handleLogout}
+                  />
+                ) : (
+                  <Navigate to="/login" replace />
+                )
+              }
+            >
+              <Route index element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={<DashboardPage />} />
+              <Route path="/products" element={<ProductsPage />} />
+              <Route path="/inventory" element={<InventoryPage />} />
+              <Route path="/sales" element={<SalesPage />} />
+              <Route path="/sales-history" element={<SalesHistoryPage />} />
+              <Route path="/analytics" element={<AnalyticsPage />} />
+            </Route>
+          </Routes>
+        </Router>
+      </BackendProvider>
+    </ErrorBoundary>
   );
+}
+
+class ErrorBoundary extends React.Component<
+  { children: ReactNode },
+  { hasError: boolean; message?: string }
+> {
+  state: { hasError: boolean; message?: string } = { hasError: false };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error.message };
+  }
+
+  componentDidCatch(error: Error, info: unknown) {
+    // eslint-disable-next-line no-console
+    console.error("Unhandled render error:", error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6">
+          <div className="max-w-xl rounded-2xl border border-rose-200 bg-rose-50 p-8 text-rose-700 shadow">
+            <h2 className="text-xl font-semibold">Something went wrong</h2>
+            <p className="mt-2 text-sm">
+              An unexpected error occurred while rendering the app:{" "}
+              {this.state.message}
+            </p>
+            <div className="mt-4">
+              <button
+                onClick={() => window.location.reload()}
+                className="rounded-lg bg-rose-600 px-4 py-2 text-white"
+              >
+                Reload
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
 }
 
 function LoginPage({
   theme,
   setTheme,
-  onLogin,
+  onAuthSubmit,
 }: {
   theme: ThemeMode;
   setTheme: (theme: ThemeMode) => void;
-  onLogin: (rememberMe: boolean) => void;
+  onAuthSubmit: (input: {
+    email: string;
+    password: string;
+    rememberMe: boolean;
+  }) => Promise<AuthSubmitResult>;
 }) {
   const navigate = useNavigate();
-  const [email, setEmail] = useState("manager@stockmango.com");
-  const [password, setPassword] = useState("admin123");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [rememberMe, setRememberMe] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [statusTone, setStatusTone] = useState<
+    "error" | "success" | "info" | null
+  >(null);
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    onLogin(rememberMe);
+    setIsSubmitting(true);
+    setStatusMessage(null);
+    setStatusTone(null);
+
+    const result = await onAuthSubmit({
+      email,
+      password,
+      rememberMe,
+    });
+
+    setIsSubmitting(false);
+    setStatusMessage(result.message);
+
+    if (result.status === "error") {
+      setStatusTone("error");
+      return;
+    }
+
+    setStatusTone("success");
     navigate("/dashboard");
   };
 
@@ -236,119 +446,115 @@ function LoginPage({
               <div className="space-y-4">
                 <h1 className="max-w-xl text-5xl font-semibold leading-tight text-slate-900 dark:text-white">
                   Manage stock, sales, profit, and inventory flow from one
-                  elegant SaaS workspace.
+                  elegant workspace.
                 </h1>
-                <p className="max-w-xl text-base leading-7 text-slate-600 dark:text-slate-300">
-                  Mock-first frontend built for a future Supabase backend. This
-                  dashboard gives a polished ERP feel with modern analytics and
-                  responsive operations screens.
+                <p className="max-w-lg text-base leading-7 text-slate-600 dark:text-slate-300">
+                  Track products, register sales, and keep stock in sync with a
+                  clean dashboard built for daily operations.
                 </p>
               </div>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-3">
-              {[
-                ["24h Alerts", "8 critical items"],
-                ["Sales Velocity", "Br 128k today"],
-                ["Inventory Accuracy", "99.2% synced"],
-              ].map(([title, value]) => (
-                <div
-                  key={title}
-                  className="rounded-2xl border border-slate-200 bg-white/75 p-4 shadow-glow dark:border-slate-700/80 dark:bg-slate-900/75"
-                >
-                  <div className="text-sm text-slate-500 dark:text-slate-400">
-                    {title}
-                  </div>
-                  <div className="mt-2 text-2xl font-semibold text-slate-900 dark:text-white">
-                    {value}
-                  </div>
-                </div>
-              ))}
             </div>
           </div>
 
-          <div className="flex flex-col bg-white/80 p-6 sm:p-8 dark:bg-slate-950/85">
-            <div className="mb-6 flex items-center justify-between">
-              <div>
-                <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">
-                  Sign in
-                </h2>
-                <p className="text-sm text-slate-500 dark:text-slate-400">
-                  Access the stock operations dashboard
-                </p>
-              </div>
-              <button
-                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 transition hover:scale-105 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                type="button"
-                aria-label="Toggle theme"
-              >
-                {theme === "dark" ? (
-                  <SunMedium className="h-4 w-4" />
-                ) : (
-                  <MoonStar className="h-4 w-4" />
-                )}
-              </button>
-            </div>
-
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-slate-700 dark:text-slate-200">
-                  Email
-                </label>
-                <input
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  type="email"
-                  className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-500 dark:border-slate-700 dark:bg-slate-900 dark:text-white dark:placeholder:text-slate-500 dark:focus:border-sky-400/60"
-                  placeholder="you@company.com"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-slate-700 dark:text-slate-200">
-                  Password
-                </label>
-                <div className="relative">
-                  <input
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    type={showPassword ? "text" : "password"}
-                    className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 pr-14 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-500 dark:border-slate-700 dark:bg-slate-900 dark:text-white dark:placeholder:text-slate-500 dark:focus:border-sky-400/60"
-                    placeholder="Enter your password"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword((current) => !current)}
-                    className="absolute inset-y-0 right-2 my-auto rounded-xl px-3 text-xs text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
-                  >
-                    {showPassword ? "Hide" : "Show"}
-                  </button>
+          <div className="p-8 sm:p-10">
+            <div className="mx-auto max-w-md">
+              <div className="mb-8 flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium uppercase tracking-[0.3em] text-sky-500 dark:text-sky-300">
+                    StockMangemnet
+                  </p>
+                  <h2 className="mt-2 text-3xl font-semibold text-slate-900 dark:text-white">
+                    Sign in with Supabase
+                  </h2>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                  className="rounded-2xl border border-slate-200 p-3 text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                >
+                  {theme === "dark" ? (
+                    <SunMedium className="h-5 w-5" />
+                  ) : (
+                    <MoonStar className="h-5 w-5" />
+                  )}
+                </button>
               </div>
 
-              <label className="flex items-center gap-3 text-sm text-slate-600 dark:text-slate-300">
-                <input
-                  checked={rememberMe}
-                  onChange={(event) => setRememberMe(event.target.checked)}
-                  type="checkbox"
-                  className="h-4 w-4 rounded border-slate-400 bg-white text-sky-500 focus:ring-sky-500 dark:border-slate-600 dark:bg-slate-900"
-                />
-                Remember me
-              </label>
+              {statusMessage ? (
+                <div
+                  className={cn(
+                    "mb-4 rounded-2xl border px-4 py-3 text-sm",
+                    statusTone === "error" &&
+                      "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200",
+                    statusTone === "success" &&
+                      "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200",
+                    statusTone === "info" &&
+                      "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/60 dark:bg-sky-950/40 dark:text-sky-200",
+                  )}
+                >
+                  {statusMessage}
+                </div>
+              ) : null}
 
-              <button
-                type="submit"
-                className="group inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-sky-500 to-cyan-400 font-medium text-slate-950 transition hover:scale-[1.01] hover:shadow-[0_16px_40px_rgba(34,211,238,0.3)]"
-              >
-                Login
-                <ArrowUpRight className="h-4 w-4 transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
-              </button>
-            </form>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <label className="block space-y-2">
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                    Email
+                  </span>
+                  <input
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    type="email"
+                    placeholder="name@company.com"
+                    className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none transition placeholder:text-slate-400 focus:border-sky-400 dark:border-slate-700 dark:bg-slate-950"
+                  />
+                </label>
 
-            <div className="mt-6 rounded-2xl border border-slate-200 bg-white/70 p-4 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
-              Demo credentials are prefilled. This frontend stores a mock
-              session locally and does not connect to a backend yet.
+                <label className="block space-y-2">
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                    Password
+                  </span>
+                  <div className="relative">
+                    <input
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      type={showPassword ? "text" : "password"}
+                      placeholder="Minimum 6 characters"
+                      className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 pr-14 text-sm outline-none transition placeholder:text-slate-400 focus:border-sky-400 dark:border-slate-700 dark:bg-slate-950"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((current) => !current)}
+                      className="absolute inset-y-0 right-0 px-4 text-sm font-medium text-sky-500"
+                    >
+                      {showPassword ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                </label>
+
+                <label className="flex items-center gap-3 text-sm text-slate-600 dark:text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(event) => setRememberMe(event.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-500 focus:ring-sky-400"
+                  />
+                  Remember me
+                </label>
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-sky-500 to-cyan-400 text-sm font-medium text-white shadow-md shadow-sky-500/20 transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  <ArrowUpRight className="h-4 w-4" />
+                  {isSubmitting ? "Working..." : "Enter dashboard"}
+                </button>
+              </form>
+
+              <p className="mt-4 text-sm text-slate-500 dark:text-slate-400">
+                Use your Supabase Auth credentials to sign in.
+              </p>
             </div>
           </div>
         </div>
@@ -366,12 +572,11 @@ function DashboardLayout({
   setTheme: (theme: ThemeMode) => void;
   onLogout: () => void;
 }) {
+  const { isLoading } = useBackendData();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
-  const [notificationMenuOpen, setNotificationMenuOpen] = useState(false);
   const location = useLocation();
   const profileRef = useRef<HTMLDivElement>(null);
-  const notificationRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const handlePointerDown = (event: MouseEvent) => {
@@ -380,13 +585,6 @@ function DashboardLayout({
         !profileRef.current.contains(event.target as Node)
       ) {
         setProfileMenuOpen(false);
-      }
-
-      if (
-        notificationRef.current &&
-        !notificationRef.current.contains(event.target as Node)
-      ) {
-        setNotificationMenuOpen(false);
       }
     };
 
@@ -404,6 +602,7 @@ function DashboardLayout({
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 transition-colors dark:bg-slate-950 dark:text-slate-100">
+      {isLoading ? <LoadingOverlay /> : null}
       <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.1),_transparent_30%),radial-gradient(circle_at_80%_0%,_rgba(16,185,129,0.09),_transparent_25%)] dark:bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.14),_transparent_30%),radial-gradient(circle_at_80%_0%,_rgba(16,185,129,0.12),_transparent_25%)]" />
 
       <div className="flex min-h-screen">
@@ -498,44 +697,6 @@ function DashboardLayout({
               </div>
 
               <div className="flex items-center gap-3">
-                <div ref={notificationRef} className="relative">
-                  <button
-                    type="button"
-                    onClick={() => setNotificationMenuOpen((value) => !value)}
-                    className="relative rounded-2xl border border-slate-200 bg-white p-2 text-slate-700 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
-                  >
-                    <Bell className="h-5 w-5" />
-                    <span className="absolute right-1 top-1 h-2.5 w-2.5 rounded-full bg-rose-500" />
-                  </button>
-
-                  {notificationMenuOpen ? (
-                    <div className="absolute right-0 mt-3 w-80 rounded-3xl border border-slate-200 bg-white p-4 shadow-soft dark:border-slate-800 dark:bg-slate-900">
-                      <div className="flex items-center justify-between">
-                        <div className="font-semibold text-slate-900 dark:text-white">
-                          Notifications
-                        </div>
-                        <button className="text-xs text-sky-500" type="button">
-                          Mark all read
-                        </button>
-                      </div>
-                      <div className="mt-4 space-y-3 text-sm">
-                        {[
-                          "Rice 25kg Bag is below the low stock threshold.",
-                          "A new high-value sale was recorded an hour ago.",
-                          "Inventory value updated from latest purchase batch.",
-                        ].map((message) => (
-                          <div
-                            key={message}
-                            className="rounded-2xl bg-slate-50 p-3 text-slate-600 dark:bg-slate-950 dark:text-slate-300"
-                          >
-                            {message}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-
                 <button
                   type="button"
                   onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -570,10 +731,7 @@ function DashboardLayout({
 
                   {profileMenuOpen ? (
                     <div className="absolute right-0 mt-3 w-56 rounded-3xl border border-slate-200 bg-white p-2 shadow-soft dark:border-slate-800 dark:bg-slate-900">
-                      {[
-                        { label: "Profile", icon: UserCircle2 },
-                        { label: "Logout", icon: LogOut },
-                      ].map((item) => {
+                      {[{ label: "Logout", icon: LogOut }].map((item) => {
                         const Icon = item.icon;
 
                         return (
@@ -610,6 +768,14 @@ function DashboardLayout({
 }
 
 function DashboardPage() {
+  const {
+    dashboardMetricsByRange,
+    salesOverviewByRange,
+    bestSellingProducts,
+    monthlyRevenue,
+    recentSales,
+    lowStockAlerts,
+  } = useBackendData();
   const [dateRange, setDateRange] = useState<DateRangeKey>("30d");
   const [customStart, setCustomStart] = useState("2026-05-01");
   const [customEnd, setCustomEnd] = useState("2026-05-30");
@@ -906,6 +1072,7 @@ function DashboardPage() {
 }
 
 function ProductsPage() {
+  const { products, saveProduct, deleteProduct } = useBackendData();
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
   const [stockStatus, setStockStatus] = useState<
@@ -923,8 +1090,12 @@ function ProductsPage() {
 
   const filteredProducts = products.filter((product) => {
     const matchesSearch =
-      product.name.toLowerCase().includes(search.toLowerCase()) ||
-      product.sku.toLowerCase().includes(search.toLowerCase());
+      String(product.name ?? "")
+        .toLowerCase()
+        .includes(search.toLowerCase()) ||
+      String(product.sku ?? "")
+        .toLowerCase()
+        .includes(search.toLowerCase());
     const matchesCategory = category === "All" || product.category === category;
     const matchesStockStatus =
       stockStatus === "All" || product.status === stockStatus;
@@ -1096,34 +1267,42 @@ function ProductsPage() {
         </div>
       </div>
 
+      <ConfirmModal
+        open={isDeleteOpen}
+        title="Delete product"
+        description={
+          selectedProduct
+            ? `Remove ${selectedProduct.name} from the catalog?`
+            : "Remove this product from the catalog?"
+        }
+        confirmLabel="Delete"
+        onCancel={() => setIsDeleteOpen(false)}
+        onConfirm={async () => {
+          if (selectedProduct) {
+            await deleteProduct(selectedProduct.id);
+          }
+          setIsDeleteOpen(false);
+        }}
+      />
       <ProductModal
         open={isAddOpen}
         onClose={() => setIsAddOpen(false)}
         mode="Add"
+        onSave={saveProduct}
       />
       <ProductModal
         open={isEditOpen}
         onClose={() => setIsEditOpen(false)}
         mode="Edit"
         product={selectedProduct}
-      />
-      <ConfirmModal
-        open={isDeleteOpen}
-        title="Delete product"
-        description={
-          selectedProduct
-            ? `Remove ${selectedProduct.name} from the catalog? This is a mock action only.`
-            : "Remove this product from the catalog?"
-        }
-        confirmLabel="Delete"
-        onCancel={() => setIsDeleteOpen(false)}
-        onConfirm={() => setIsDeleteOpen(false)}
+        onSave={saveProduct}
       />
     </div>
   );
 }
 
 function InventoryPage() {
+  const { inventoryBatches, addInventoryBatch } = useBackendData();
   const [isModalOpen, setIsModalOpen] = useState(false);
 
   return (
@@ -1180,41 +1359,44 @@ function InventoryPage() {
                 className="transition hover:bg-slate-50 dark:hover:bg-slate-950/70"
               >
                 <td className="px-4 py-4 font-medium text-slate-900 dark:text-white">
-                  {batch.product}
+                  {batch.product_name}
                 </td>
                 <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
                   {batch.quantity}
                 </td>
                 <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                  {formatBirr(batch.unitCost)}
+                  {formatBirr(batch.unit_cost)}
                 </td>
                 <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                  {batch.remainingStock}
+                  {batch.remaining_stock}
                 </td>
                 <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                  {batch.purchaseDate}
+                  {batch.purchase_date}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-
-      <StockModal open={isModalOpen} onClose={() => setIsModalOpen(false)} />
+      <StockModal
+        open={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        onSave={addInventoryBatch}
+      />
     </div>
   );
 }
 
 function SalesPage() {
+  const { salesCatalog, products, registerSale } = useBackendData();
   const [search, setSearch] = useState("");
-  const [cart, setCart] = useState<CartItem[]>([
-    { id: 1, name: "Premium Cooking Oil", price: 0, quantity: 2 },
-    { id: 4, name: "Orange Juice 1L", price: 0, quantity: 3 },
-  ]);
+  const [cart, setCart] = useState<CartItem[]>([]);
   const [paymentMethod, setPaymentMethod] = useState("Cash");
 
   const filteredCatalog = salesCatalog.filter((product) =>
-    product.name.toLowerCase().includes(search.toLowerCase()),
+    String(product.name ?? "")
+      .toLowerCase()
+      .includes(search.toLowerCase()),
   );
 
   const updateQuantity = (id: number, quantity: number) => {
@@ -1288,7 +1470,7 @@ function SalesPage() {
                       {
                         id: product.id,
                         name: product.name,
-                        price: 0,
+                        price: product.price,
                         quantity: 1,
                       },
                     ];
@@ -1405,6 +1587,29 @@ function SalesPage() {
 
             <button
               type="button"
+              onClick={async () => {
+                await registerSale({
+                  customer: "Walk-in Customer",
+                  paymentMethod: paymentMethod as
+                    | "Cash"
+                    | "Card"
+                    | "Mobile Money"
+                    | "Bank Transfer",
+                  items: cart.map((item) => {
+                    const match = products.find(
+                      (product) => product.id === item.id,
+                    );
+                    return {
+                      productId: item.id,
+                      productName: item.name,
+                      quantity: item.quantity,
+                      price: item.price,
+                      cost: match?.cost ?? 0,
+                    };
+                  }),
+                });
+                setCart([]);
+              }}
               className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-400 px-4 py-3 text-sm font-medium text-white shadow-md shadow-emerald-500/20 transition hover:-translate-y-0.5"
             >
               <CheckCircle2 className="h-4 w-4" /> Complete sale
@@ -1437,125 +1642,9 @@ function SalesPage() {
   );
 }
 
-function SalesHistoryPage() {
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<
-    "All" | "Completed" | "Pending" | "Refunded"
-  >("All");
-
-  const filteredHistory = salesHistory.filter((sale) => {
-    const matchesSearch =
-      sale.id.toLowerCase().includes(search.toLowerCase()) ||
-      sale.customer.toLowerCase().includes(search.toLowerCase());
-    const matchesStatus =
-      statusFilter === "All" || sale.status === statusFilter;
-    return matchesSearch && matchesStatus;
-  });
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">
-          Sales history
-        </h2>
-        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-          Track all registered sales with date, payment method, and status.
-        </p>
-      </div>
-
-      <div className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900 md:grid-cols-[1fr_auto] md:items-center">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search by sale ID or customer"
-            className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 pl-11 pr-4 text-sm outline-none transition placeholder:text-slate-400 focus:border-sky-400 dark:border-slate-800 dark:bg-slate-950"
-          />
-        </div>
-
-        <div className="flex flex-wrap gap-2">
-          {["All", "Completed", "Pending", "Refunded"].map((item) => (
-            <button
-              key={item}
-              type="button"
-              onClick={() => setStatusFilter(item as typeof statusFilter)}
-              className={cn(
-                "rounded-xl px-3 py-2 text-sm font-medium transition",
-                statusFilter === item
-                  ? "bg-slate-900 text-white dark:bg-white dark:text-slate-950"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700",
-              )}
-            >
-              {item}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 dark:divide-slate-800">
-            <thead className="bg-slate-50 dark:bg-slate-950/60">
-              <tr>
-                {[
-                  "Sale ID",
-                  "Customer",
-                  "Date",
-                  "Items",
-                  "Payment",
-                  "Amount",
-                  "Status",
-                ].map((heading) => (
-                  <th
-                    key={heading}
-                    className="px-4 py-4 text-left text-xs font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400"
-                  >
-                    {heading}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-              {filteredHistory.map((sale) => (
-                <tr
-                  key={sale.id}
-                  className="transition hover:bg-slate-50 dark:hover:bg-slate-950/70"
-                >
-                  <td className="px-4 py-4 font-medium text-slate-900 dark:text-white">
-                    {sale.id}
-                  </td>
-                  <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                    {sale.customer}
-                  </td>
-                  <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                    {sale.date}
-                  </td>
-                  <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                    {sale.items}
-                  </td>
-                  <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
-                    {sale.paymentMethod}
-                  </td>
-                  <td className="px-4 py-4 font-medium text-slate-900 dark:text-white">
-                    {formatBirr(sale.amount)}
-                  </td>
-                  <td className="px-4 py-4">
-                    <Badge tone={saleStatusTone(sale.status)}>
-                      {sale.status}
-                    </Badge>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function AnalyticsPage() {
+  const { analyticsRevenue, inventoryMovement, analyticsTables } =
+    useBackendData();
   return (
     <div className="space-y-6">
       <div>
@@ -1648,7 +1737,7 @@ function AnalyticsPage() {
                 outerRadius={108}
                 paddingAngle={3}
               >
-                {["#38bdf8", "#fb7185", "#a78bfa"].map((color, index) => (
+                {["#38bdf8", "#fb7185", "#a78bfa"].map((color) => (
                   <Cell key={color} fill={color} />
                 ))}
               </Pie>
@@ -1685,7 +1774,7 @@ function AnalyticsPage() {
         <Panel title="Most profitable products">
           <AnalyticsTable
             rows={analyticsTables.mostProfitable}
-            columns={["name", "revenue", "profit", "margin"]}
+            columns={["name", "profit", "revenue", "margin"]}
           />
         </Panel>
         <Panel title="Slow moving products">
@@ -1699,89 +1788,180 @@ function AnalyticsPage() {
   );
 }
 
-function ReportsPage() {
+function SalesHistoryPage() {
+  const { saleItems = [], salesHistory = [] } = useBackendData();
+
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<
+    "All" | "Completed" | "Pending" | "Refunded"
+  >("All");
+
+  // combine sale item with sale info
+  const enriched = saleItems.map((item) => {
+    const sale = salesHistory.find(
+      (s) => String(s?.id) === String(item?.sale_id),
+    );
+
+    return {
+      ...item,
+
+      // use camelCase because your frontend types use camelCase
+      saleDate: sale?.date || "N/A",
+      paymentMethod: sale?.paymentMethod || "N/A",
+      saleStatus: sale?.status || "Pending",
+
+      // fallback until product join exists
+      productName: item?.product_name || `Product #${item?.product_id}`,
+    };
+  });
+
+  // filtering
+  const filtered = enriched.filter((row) => {
+    const searchText = String(search || "").toLowerCase();
+
+    const productName = String(row?.productName || "").toLowerCase();
+
+    const saleId = String(row?.sale_id || "").toLowerCase();
+
+    const matchesSearch =
+      productName.includes(searchText) || saleId.includes(searchText);
+
+    const matchesStatus =
+      statusFilter === "All" || String(row?.saleStatus || "") === statusFilter;
+
+    return matchesSearch && matchesStatus;
+  });
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">
-            Reports
-          </h2>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            Download sales, profit, and inventory reports with date filters and
-            export actions.
-          </p>
+      {/* Header */}
+      <div>
+        <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">
+          Sales History
+        </h2>
+
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+          Itemized sales including quantity, price, payment method, and date.
+        </p>
+      </div>
+
+      {/* Search + Filters */}
+      <div className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900 md:grid-cols-[1fr_auto] md:items-center">
+        {/* Search */}
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search by product or sale ID"
+            className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 pl-11 pr-4 text-sm outline-none transition placeholder:text-slate-400 focus:border-sky-400 dark:border-slate-800 dark:bg-slate-950"
+          />
         </div>
+
+        {/* Filter Buttons */}
         <div className="flex flex-wrap gap-2">
-          <button
-            className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
-            type="button"
-          >
-            <FileText className="h-4 w-4" /> Export PDF
-          </button>
-          <button
-            className="inline-flex items-center gap-2 rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-400"
-            type="button"
-          >
-            <Download className="h-4 w-4" /> Export Excel
-          </button>
-        </div>
-      </div>
-
-      <div className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:grid-cols-2 xl:grid-cols-4">
-        {[
-          "Sales reports",
-          "Profit reports",
-          "Inventory reports",
-          "Audit summaries",
-        ].map((item) => (
-          <div
-            key={item}
-            className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950"
-          >
-            <div className="font-medium text-slate-900 dark:text-white">
+          {["All", "Completed", "Pending", "Refunded"].map((item) => (
+            <button
+              key={item}
+              type="button"
+              onClick={() => setStatusFilter(item as typeof statusFilter)}
+              className={cn(
+                "rounded-xl px-3 py-2 text-sm font-medium transition",
+                statusFilter === item
+                  ? "bg-slate-900 text-white dark:bg-white dark:text-slate-950"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700",
+              )}
+            >
               {item}
-            </div>
-            <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-              Filter by date range and export in one click.
-            </div>
-          </div>
-        ))}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <Panel
-        title="Date range filters"
-        action={<Badge tone="info">Ready for export</Badge>}
-      >
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <Field
-            label="Start date"
-            type="date"
-            value="2026-05-01"
-            onChange={() => undefined}
-          />
-          <Field
-            label="End date"
-            type="date"
-            value="2026-05-31"
-            onChange={() => undefined}
-          />
-          <Field
-            label="Report type"
-            type="select"
-            value="Sales"
-            onChange={() => undefined}
-            options={["Sales", "Profit", "Inventory"]}
-          />
-          <Field
-            label="Format"
-            type="select"
-            value="PDF"
-            onChange={() => undefined}
-            options={["PDF", "Excel"]}
-          />
+      {/* Table */}
+      <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-slate-200 dark:divide-slate-800">
+            {/* Head */}
+            <thead className="bg-slate-50 dark:bg-slate-950/60">
+              <tr>
+                {[
+                  "Product",
+                  "Quantity",
+                  "Unit Price",
+                  "Total",
+                  "Date",
+                  "Payment",
+                ].map((heading) => (
+                  <th
+                    key={heading}
+                    className="px-4 py-4 text-left text-xs font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400"
+                  >
+                    {heading}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+
+            {/* Body */}
+            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+              {filtered.length > 0 ? (
+                filtered.map((row) => (
+                  <tr
+                    key={`${row.sale_id}-${row.id}`}
+                    className="transition hover:bg-slate-50 dark:hover:bg-slate-950/70"
+                  >
+                    {/* Product */}
+                    <td className="px-4 py-4 font-medium text-slate-900 dark:text-white">
+                      {row.productName}
+                    </td>
+
+                    {/* Quantity */}
+                    <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
+                      {row.quantity ?? 0}
+                    </td>
+
+                    {/* Unit Price */}
+                    <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
+                      {formatBirr(Number(row.price ?? 0))}
+                    </td>
+
+                    {/* Total */}
+                    <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
+                      {formatBirr(
+                        Number(
+                          row.total ??
+                            Number(row.price ?? 0) * Number(row.quantity ?? 0),
+                        ),
+                      )}
+                    </td>
+
+                    {/* Date */}
+                    <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
+                      {row.saleDate}
+                    </td>
+
+                    {/* Payment */}
+                    <td className="px-4 py-4 text-slate-600 dark:text-slate-300">
+                      {row.paymentMethod}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td
+                    colSpan={6}
+                    className="px-4 py-10 text-center text-slate-500"
+                  >
+                    No sales history found
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
-      </Panel>
+      </div>
     </div>
   );
 }
@@ -1829,20 +2009,22 @@ function ProductModal({
   onClose,
   mode,
   product,
+  onSave,
 }: {
   open: boolean;
   onClose: () => void;
   mode: "Add" | "Edit";
   product?: Product | null;
+  onSave: (
+    product: Partial<Product> & { image?: string },
+  ) => Promise<void> | void;
 }) {
   const [form, setForm] = useState({
     name: product?.name ?? "",
     sku: product?.sku ?? "",
     category: product?.category ?? "Groceries",
     description: product?.description ?? "",
-    imageName: "",
   });
-  const [imagePreview, setImagePreview] = useState(product?.image ?? "");
 
   useEffect(() => {
     if (open) {
@@ -1851,18 +2033,19 @@ function ProductModal({
         sku: product?.sku ?? "",
         category: product?.category ?? "Groceries",
         description: product?.description ?? "",
-        imageName: "",
       });
-      setImagePreview(product?.image ?? "");
     }
   }, [open, product]);
+
+  const imagePreview =
+    form.name.trim() !== "" ? getProductImage(form.name) : "";
 
   return (
     <Modal
       open={open}
       onClose={onClose}
       title={`${mode} product`}
-      subtitle="Frontend-only product form for future persistence integration."
+      subtitle="Save product details into the catalog."
     >
       <div className="grid gap-4 md:grid-cols-2">
         <Field
@@ -1888,35 +2071,21 @@ function ProductModal({
           }
           options={["Groceries", "Household", "Beverages", "Stationery"]}
         />
-        <label className="space-y-2">
-          <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
-            Product image file
-          </span>
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (!file) {
-                return;
-              }
-
-              setForm((current) => ({ ...current, imageName: file.name }));
-              setImagePreview(URL.createObjectURL(file));
-            }}
-            className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition file:mr-3 file:rounded-xl file:border-0 file:bg-sky-500 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-sky-400 dark:border-slate-800 dark:bg-slate-950"
-          />
-          <div className="text-xs text-slate-500 dark:text-slate-400">
-            {form.imageName || "No file selected"}
-          </div>
-          {imagePreview ? (
+        {imagePreview ? (
+          <div className="space-y-2">
+            <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+              Product image preview
+            </span>
             <img
               src={imagePreview}
               alt="Product preview"
               className="h-24 w-24 rounded-2xl object-cover"
             />
-          ) : null}
-        </label>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              Auto-generated from product name
+            </div>
+          </div>
+        ) : null}
         <div className="md:col-span-2">
           <Field
             label="Description"
@@ -1938,7 +2107,17 @@ function ProductModal({
         </button>
         <button
           type="button"
-          onClick={onClose}
+          onClick={async () => {
+            await onSave({
+              id: product?.id,
+              name: form.name,
+              sku: form.sku,
+              category: form.category,
+              description: form.description,
+              image: imagePreview,
+            });
+            onClose();
+          }}
           className="rounded-2xl bg-sky-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-sky-400"
         >
           Save product
@@ -1948,7 +2127,42 @@ function ProductModal({
   );
 }
 
-function StockModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function StockModal({
+  open,
+  onClose,
+  onSave,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSave: (batch: {
+    productId: number;
+    productName: string;
+    quantity: number;
+    unitCost: number;
+    supplier: string;
+    purchaseDate: string;
+  }) => Promise<void> | void;
+}) {
+  const { products } = useBackendData();
+  const [productName, setProductName] = useState(products[0]?.name ?? "");
+  const [quantity, setQuantity] = useState("120");
+  const [unitCost, setUnitCost] = useState("305");
+  const [supplier, setSupplier] = useState("Prime Supplies PLC");
+  const [purchaseDate, setPurchaseDate] = useState("2026-05-18");
+
+  useEffect(() => {
+    if (open) {
+      setProductName(products[0]?.name ?? "");
+      setQuantity("120");
+      setUnitCost("305");
+      setSupplier("Prime Supplies PLC");
+      setPurchaseDate("2026-05-18");
+    }
+  }, [open, products]);
+
+  const selectedProduct = products.find(
+    (product) => product.name === productName,
+  );
   return (
     <Modal
       open={open}
@@ -1960,22 +2174,18 @@ function StockModal({ open, onClose }: { open: boolean; onClose: () => void }) {
         <Field
           label="Product selector"
           type="select"
-          value={products[0].name}
-          onChange={() => undefined}
+          value={productName}
+          onChange={setProductName}
           options={products.map((product) => product.name)}
         />
-        <Field label="Quantity" value="120" onChange={() => undefined} />
-        <Field label="Unit cost" value="305" onChange={() => undefined} />
-        <Field
-          label="Supplier"
-          value="Prime Supplies PLC"
-          onChange={() => undefined}
-        />
+        <Field label="Quantity" value={quantity} onChange={setQuantity} />
+        <Field label="Unit cost" value={unitCost} onChange={setUnitCost} />
+        <Field label="Supplier" value={supplier} onChange={setSupplier} />
         <Field
           label="Purchase date"
           type="date"
-          value="2026-05-18"
-          onChange={() => undefined}
+          value={purchaseDate}
+          onChange={setPurchaseDate}
         />
       </div>
       <div className="mt-6 rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900 dark:border-sky-900/40 dark:bg-sky-950/20 dark:text-sky-100">
@@ -1992,7 +2202,22 @@ function StockModal({ open, onClose }: { open: boolean; onClose: () => void }) {
         </button>
         <button
           type="button"
-          onClick={onClose}
+          onClick={async () => {
+            if (!selectedProduct) {
+              onClose();
+              return;
+            }
+
+            await onSave({
+              productId: selectedProduct.id,
+              productName: selectedProduct.name,
+              quantity: Number(quantity),
+              unitCost: Number(unitCost),
+              supplier,
+              purchaseDate,
+            });
+            onClose();
+          }}
           className="rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-400"
         >
           Save stock purchase
@@ -2301,20 +2526,8 @@ function statusTone(status: Product["status"]) {
   return "danger";
 }
 
-function saleStatusTone(status: "Completed" | "Pending" | "Refunded") {
-  if (status === "Completed") {
-    return "success";
-  }
-
-  if (status === "Pending") {
-    return "warning";
-  }
-
-  return "danger";
-}
-
 function formatBirr(value: number) {
-  return `Br ${currencyFormatter.format(value)}`;
+  return `Br ${currencyFormatter.format(Number.isFinite(value) ? value : 0)}`;
 }
 
 export default App;
