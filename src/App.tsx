@@ -1082,6 +1082,7 @@ function ProductsPage() {
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [isDeleteOpen, setIsDeleteOpen] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const categories = [
     "All",
@@ -1276,12 +1277,18 @@ function ProductsPage() {
             : "Remove this product from the catalog?"
         }
         confirmLabel="Delete"
+        isLoading={isDeleting}
         onCancel={() => setIsDeleteOpen(false)}
         onConfirm={async () => {
           if (selectedProduct) {
-            await deleteProduct(selectedProduct.id);
+            setIsDeleting(true);
+            try {
+              await deleteProduct(selectedProduct.id);
+            } finally {
+              setIsDeleting(false);
+              setIsDeleteOpen(false);
+            }
           }
-          setIsDeleteOpen(false);
         }}
       />
       <ProductModal
@@ -2234,6 +2241,7 @@ function ConfirmModal({
   confirmLabel,
   onCancel,
   onConfirm,
+  isLoading = false,
 }: {
   open: boolean;
   title: string;
@@ -2241,6 +2249,7 @@ function ConfirmModal({
   confirmLabel: string;
   onCancel: () => void;
   onConfirm: () => void;
+  isLoading?: boolean;
 }) {
   return (
     <Modal open={open} onClose={onCancel} title={title} subtitle={description}>
@@ -2248,16 +2257,18 @@ function ConfirmModal({
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-2xl border border-slate-200 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-800 dark:text-slate-200 dark:hover:bg-slate-800"
+          disabled={isLoading}
+          className="rounded-2xl border border-slate-200 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed dark:border-slate-800 dark:text-slate-200 dark:hover:bg-slate-800"
         >
           Cancel
         </button>
         <button
           type="button"
           onClick={onConfirm}
-          className="rounded-2xl bg-rose-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-rose-400"
+          disabled={isLoading}
+          className="rounded-2xl bg-rose-500 px-4 py-3 text-sm font-medium text-white transition hover:bg-rose-400 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {confirmLabel}
+          {isLoading ? "Deleting..." : confirmLabel}
         </button>
       </div>
     </Modal>
